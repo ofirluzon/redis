@@ -38,7 +38,10 @@
  * C-level DB API
  *----------------------------------------------------------------------------*/
 
-robj *lookupKey(redisDb *db, robj *key) {
+/* Low level key lookup API, not actually called directly from commands
+ * implementations that should instead rely on lookupKeyRead(),
+ * lookupKeyWrite() and lookupKeyReadWithFlags(). */
+robj *lookupKey(redisDb *db, robj *key, int flags) {
     dictEntry *de = dictFind(db->dict,key->ptr);
     if (de) {
         robj *val = dictGetVal(de);
@@ -46,15 +49,46 @@ robj *lookupKey(redisDb *db, robj *key) {
         /* Update the access time for the ageing algorithm.
          * Don't do it if we have a saving child, as this will trigger
          * a copy on write madness. */
-        if (server.rdb_child_pid == -1 && server.aof_child_pid == -1)
-            val->lru = LRU_CLOCK();
+        if (server.rdb_child_pid == -1 &&
+            server.aof_child_pid == -1 &&
+            !(flags & LOOKUP_NOTOUCH))
+        {
+            if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+                unsigned long ldt = val->lru >> 8;
+                unsigned long counter = LFULogIncr(val->lru & 255);
+                val->lru = (ldt << 8) | counter;
+            } else {
+                val->lru = LRU_CLOCK();
+            }
+        }
         return val;
     } else {
         return NULL;
     }
 }
 
-robj *lookupKeyRead(redisDb *db, robj *key) {
+/* Lookup a key for read operations, or return NULL if the key is not found
+ * in the specified DB.
+ *
+ * As a side effect of calling this function:
+ * 1. A key gets expired if it reached it's TTL.
+ * 2. The key last access time is updated.
+ * 3. The global keys hits/misses stats are updated (reported in INFO).
+ *
+ * This API should not be used when we write to the key after obtaining
+ * the object linked to the key, but only for read only operations.
+ *
+ * Flags change the behavior of this command:
+ *
+ *  LOOKUP_NONE (or zero): no special flags are passed.
+ *  LOOKUP_NOTOUCH: don't alter the last access time of the key.
+ *
+ * Note: this function also returns NULL is the key is logically expired
+ * but still existing, in case this is a slave, since this API is called only
+ * for read operations. Even if the key expiry is master-driven, we can
+ * correctly report a key is expired on slaves even if the master is lagging
+ * expiring our key via DELs in the replication link. */
+robj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
     robj *val;
 
     if (expireIfNeeded(db,key) == 1) {
@@ -83,7 +117,7 @@ robj *lookupKeyRead(redisDb *db, robj *key) {
             return NULL;
         }
     }
-    val = lookupKey(db,key);
+    val = lookupKey(db,key,flags);
     if (val == NULL)
         server.stat_keyspace_misses++;
     else
@@ -91,9 +125,20 @@ robj *lookupKeyRead(redisDb *db, robj *key) {
     return val;
 }
 
+/* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
+ * common case. */
+robj *lookupKeyRead(redisDb *db, robj *key) {
+    return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
+}
+
+/* Lookup a key for write operations, and as a side effect, if needed, expires
+ * the key if its TTL is reached.
+ *
+ * Returns the linked value object if the key exists or NULL if the key
+ * does not exist in the specified DB. */
 robj *lookupKeyWrite(redisDb *db, robj *key) {
     expireIfNeeded(db,key);
-    return lookupKey(db,key);
+    return lookupKey(db,key,LOOKUP_NONE);
 }
 
 robj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
@@ -130,7 +175,14 @@ void dbOverwrite(redisDb *db, robj *key, robj *val) {
     dictEntry *de = dictFind(db->dict,key->ptr);
 
     serverAssertWithInfo(NULL,key,de != NULL);
-    dictReplace(db->dict, key->ptr, val);
+    if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+        robj *old = dictGetVal(de);
+        int saved_lru = old->lru;
+        dictReplace(db->dict, key->ptr, val);
+        val->lru = saved_lru;
+    } else {
+        dictReplace(db->dict, key->ptr, val);
+    }
 }
 
 /* High level Set operation. This function can be used in order to set
@@ -721,7 +773,7 @@ void typeCommand(client *c) {
     robj *o;
     char *type;
 
-    o = lookupKeyRead(c->db,c->argv[1]);
+    o = lookupKeyReadWithFlags(c->db,c->argv[1],LOOKUP_NOTOUCH);
     if (o == NULL) {
         type = "none";
     } else {
@@ -731,6 +783,10 @@ void typeCommand(client *c) {
         case OBJ_SET: type = "set"; break;
         case OBJ_ZSET: type = "zset"; break;
         case OBJ_HASH: type = "hash"; break;
+        case OBJ_MODULE: {
+            moduleValue *mv = o->ptr;
+            type = mv->type->name;
+        }; break;
         default: type = "unknown"; break;
         }
     }
@@ -965,126 +1021,6 @@ int expireIfNeeded(redisDb *db, robj *key) {
         "expired",key,db->id);
     return server.lazyfree_lazy_expire ? dbAsyncDelete(db,key) :
                                          dbSyncDelete(db,key);
-}
-
-/*-----------------------------------------------------------------------------
- * Expires Commands
- *----------------------------------------------------------------------------*/
-
-/* This is the generic command implementation for EXPIRE, PEXPIRE, EXPIREAT
- * and PEXPIREAT. Because the commad second argument may be relative or absolute
- * the "basetime" argument is used to signal what the base time is (either 0
- * for *AT variants of the command, or the current time for relative expires).
- *
- * unit is either UNIT_SECONDS or UNIT_MILLISECONDS, and is only used for
- * the argv[2] parameter. The basetime is always specified in milliseconds. */
-void expireGenericCommand(client *c, long long basetime, int unit) {
-    robj *key = c->argv[1], *param = c->argv[2];
-    long long when; /* unix time in milliseconds when the key will expire. */
-
-    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != C_OK)
-        return;
-
-    if (unit == UNIT_SECONDS) when *= 1000;
-    when += basetime;
-
-    /* No key, return zero. */
-    if (lookupKeyWrite(c->db,key) == NULL) {
-        addReply(c,shared.czero);
-        return;
-    }
-
-    /* EXPIRE with negative TTL, or EXPIREAT with a timestamp into the past
-     * should never be executed as a DEL when load the AOF or in the context
-     * of a slave instance.
-     *
-     * Instead we take the other branch of the IF statement setting an expire
-     * (possibly in the past) and wait for an explicit DEL from the master. */
-    if (when <= mstime() && !server.loading && !server.masterhost) {
-        robj *aux;
-
-        int deleted = server.lazyfree_lazy_expire ? dbAsyncDelete(c->db,key) :
-                                                    dbSyncDelete(c->db,key);
-        serverAssertWithInfo(c,key,deleted);
-        server.dirty++;
-
-        /* Replicate/AOF this as an explicit DEL or UNLINK. */
-        aux = server.lazyfree_lazy_expire ? shared.unlink : shared.del;
-        rewriteClientCommandVector(c,2,aux,key);
-        signalModifiedKey(c->db,key);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
-        addReply(c, shared.cone);
-        return;
-    } else {
-        setExpire(c->db,key,when);
-        addReply(c,shared.cone);
-        signalModifiedKey(c->db,key);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"expire",key,c->db->id);
-        server.dirty++;
-        return;
-    }
-}
-
-void expireCommand(client *c) {
-    expireGenericCommand(c,mstime(),UNIT_SECONDS);
-}
-
-void expireatCommand(client *c) {
-    expireGenericCommand(c,0,UNIT_SECONDS);
-}
-
-void pexpireCommand(client *c) {
-    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
-}
-
-void pexpireatCommand(client *c) {
-    expireGenericCommand(c,0,UNIT_MILLISECONDS);
-}
-
-void ttlGenericCommand(client *c, int output_ms) {
-    long long expire, ttl = -1;
-
-    /* If the key does not exist at all, return -2 */
-    if (lookupKeyRead(c->db,c->argv[1]) == NULL) {
-        addReplyLongLong(c,-2);
-        return;
-    }
-    /* The key exists. Return -1 if it has no expire, or the actual
-     * TTL value otherwise. */
-    expire = getExpire(c->db,c->argv[1]);
-    if (expire != -1) {
-        ttl = expire-mstime();
-        if (ttl < 0) ttl = 0;
-    }
-    if (ttl == -1) {
-        addReplyLongLong(c,-1);
-    } else {
-        addReplyLongLong(c,output_ms ? ttl : ((ttl+500)/1000));
-    }
-}
-
-void ttlCommand(client *c) {
-    ttlGenericCommand(c, 0);
-}
-
-void pttlCommand(client *c) {
-    ttlGenericCommand(c, 1);
-}
-
-void persistCommand(client *c) {
-    dictEntry *de;
-
-    de = dictFind(c->db->dict,c->argv[1]->ptr);
-    if (de == NULL) {
-        addReply(c,shared.czero);
-    } else {
-        if (removeExpire(c->db,c->argv[1])) {
-            addReply(c,shared.cone);
-            server.dirty++;
-        } else {
-            addReply(c,shared.czero);
-        }
-    }
 }
 
 /* -----------------------------------------------------------------------------

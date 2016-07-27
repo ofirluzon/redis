@@ -109,6 +109,7 @@ client *createClient(int fd) {
     c->repl_ack_off = 0;
     c->repl_ack_time = 0;
     c->slave_listening_port = 0;
+    c->slave_ip[0] = '\0';
     c->slave_capa = SLAVE_CAPA_NONE;
     c->reply = listCreate();
     c->reply_bytes = 0;
@@ -1605,7 +1606,7 @@ void clientCommand(client *c) {
         pauseClients(duration);
         addReply(c,shared.ok);
     } else {
-        addReplyError(c, "Syntax error, try CLIENT (LIST | KILL ip:port | GETNAME | SETNAME connection-name)");
+        addReplyError(c, "Syntax error, try CLIENT (LIST | KILL | GETNAME | SETNAME | PAUSE | REPLY)");
     }
 }
 
